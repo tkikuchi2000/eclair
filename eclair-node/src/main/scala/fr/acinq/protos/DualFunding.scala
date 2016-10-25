@@ -53,7 +53,7 @@ object DualFunding extends App {
 
   case class OpenRequest(balance: Satoshi, publicKey: BinaryData, delay: locktime) extends Message
 
-  case class OpenResponse(balance: Satoshi, inputs: Seq[OutPoint], changeOutputs: Seq[TxOut], publicKey: BinaryData, delay: locktime) extends Message
+  case class OpenResponse(balance: Satoshi, inputs: Seq[TxIn], changeOutputs: Seq[TxOut], publicKey: BinaryData, delay: locktime) extends Message
 
   case class SignatureRequest(anchorTxId: BinaryData, anchorOutputIndex: Int, commitSig: BinaryData) extends Message
 
@@ -88,11 +88,10 @@ object DualFunding extends App {
         for {
           fund <- bitcoin_client.fundTransaction(tx)
           tx1 = fund.tx
-          inputs = tx1.txIn.map(_.outPoint)
           change = tx1.txOut(fund.changepos)
           outputs = change :: Nil
         } yield {
-          val ourResponse = OpenResponse(balance, inputs, outputs, ourParams.commitPubKey, ourParams.delay)
+          val ourResponse = OpenResponse(balance, tx1.txIn, outputs, ourParams.commitPubKey, ourParams.delay)
           replyTo ! ourResponse
           context become waitingForSignatureRequest(theirRequest, ourResponse)
         }
@@ -105,7 +104,7 @@ object DualFunding extends App {
         val anchorOutput = TxOut(amount = anchorAmount, publicKeyScript = Scripts.anchorPubkeyScript(ourParams.commitPubKey, theirPub))
 
         val tx = Transaction(version = 2,
-          txIn = theirInputs.map(op => TxIn(op, sequence = TxIn.SEQUENCE_FINAL, signatureScript = Nil)),
+          txIn = theirInputs,
           txOut = anchorOutput +: theirOutputs,
           lockTime = 0)
         // it is not complete because it is missing our inputs and change outputs
@@ -136,7 +135,7 @@ object DualFunding extends App {
         val anchorAmount = theirRequest.balance + ourResponse.balance
         val anchorOutput = TxOut(amount = anchorAmount, publicKeyScript = Scripts.anchorPubkeyScript(ourParams.commitPubKey, theirRequest.publicKey))
         val anchorTx = Transaction(version = 2,
-          txIn = ourResponse.inputs.map(op => TxIn(op, sequence = TxIn.SEQUENCE_FINAL, signatureScript = Nil)),
+          txIn = ourResponse.inputs,
           txOut = anchorOutput +: ourResponse.changeOutputs,
           lockTime = 0)
 

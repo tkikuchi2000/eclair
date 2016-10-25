@@ -23,15 +23,20 @@ object SegwitFunding extends App {
     host = config.getString("eclair.bitcoind.host"),
     port = config.getInt("eclair.bitcoind.rpcport")))
 
-  def fundSegwitTx(amount: Satoshi, priv: BinaryData): Future[(Transaction, Int)] = {
+  case class FundingInputs(publishTx: Transaction, inputs: Seq[TxIn], changeOutputs: Seq[TxOut])
+
+  def fundSegwitTx(amount: Satoshi, priv: BinaryData): Future[FundingInputs] = {
     val pub = Crypto.publicKeyFromPrivateKey(priv)
-    val tx = Transaction(version = 2, txIn = Nil, txOut = TxOut(amount, Script.pay2sh(Script.pay2wpkh(pub))) :: Nil, lockTime = 0)
+    val script: BinaryData = Script.write(Script.pay2sh(Script.pay2wpkh(pub)))
+    val tx = Transaction(version = 2, txIn = Nil, txOut = TxOut(amount, script) :: Nil, lockTime = 0)
     val future = for {
       FundTransactionResponse(tx1, pos, fee) <- bitcoin.fundTransaction(tx)
       SignTransactionResponse(tx2, true) <- bitcoin.signTransaction(tx1)
-      pos = tx2.txOut.indexWhere(_.publicKeyScript == BinaryData(Script.write(Script.pay2sh(Script.pay2wpkh(pub)))))
+      pos = tx2.txOut.indexWhere(_.publicKeyScript == script)
       _ = assert(pos != -1)
-    } yield (tx2, pos)
+      changeOutputs = tx2.txOut.filterNot(_.publicKeyScript == script)
+      inputs = TxIn(OutPoint(tx2, pos), OP_PUSHDATA(Script.write(Script.pay2wpkh(pub))) :: Nil, TxIn.SEQUENCE_FINAL) :: Nil
+    } yield FundingInputs(tx2, inputs, changeOutputs)
 
     future
   }
@@ -50,24 +55,27 @@ object SegwitFunding extends App {
   }
 
   val future = for {
-    (tx1, pos1) <- fundSegwitTx(10000 satoshi, priv1)
+    FundingInputs(tx1, inputs1, outputs1) <- fundSegwitTx(10000 satoshi, priv1)
     pub1 = Crypto.publicKeyFromPrivateKey(priv1): BinaryData
-    change1 = tx1.txOut.filterNot(_ == tx1.txOut(pos1))
-    (tx2, pos2) <- fundSegwitTx(20000 satoshi, priv2)
+    FundingInputs(tx2, inputs2, outputs2) <- fundSegwitTx(20000 satoshi, priv2)
     pub2 = Crypto.publicKeyFromPrivateKey(priv2): BinaryData
-    change2 = tx2.txOut.filterNot(_ == tx2.txOut(pos2))
     anchorOutput = TxOut(30000 satoshi, Scripts.anchorPubkeyScript(pub1, pub2))
     anchorTx = Transaction(
       version = 2,
-      txIn = Seq(
-        TxIn(OutPoint(tx1, pos1), OP_PUSHDATA(Script.write(Script.pay2wpkh(pub1))) :: Nil, TxIn.SEQUENCE_FINAL),
-        TxIn(OutPoint(tx2, pos2), OP_PUSHDATA(Script.write(Script.pay2wpkh(pub2))) :: Nil, TxIn.SEQUENCE_FINAL)
-      ),
-      txOut = anchorOutput +: (change1 ++ change2),
+      txIn = inputs1 ++ inputs2,
+      txOut = anchorOutput +: (outputs1 ++ outputs2),
       lockTime = 0)
     _ = println(anchorTx.hash)
-  } yield checkSegwitTx(tx1, pos1, 10000 satoshi, priv1)
+    sig1 = Transaction.signInput(anchorTx, 0, Script.pay2pkh(pub1), SIGHASH_ANYONECANPAY | SIGHASH_ALL, 10000 satoshi, 1, priv1): BinaryData
+    sig2 = Transaction.signInput(anchorTx, 1, Script.pay2pkh(pub2), SIGHASH_ANYONECANPAY | SIGHASH_ALL, 20000 satoshi, 1, priv2): BinaryData
+    signedAnchorTx = anchorTx
+      .updateWitness(0, ScriptWitness(sig1 :: pub1 :: Nil))
+      .updateWitness(1, ScriptWitness(sig2 :: pub2 :: Nil))
+    _ = Transaction.correctlySpends(signedAnchorTx, tx1 :: tx2 :: Nil, ScriptFlags.STANDARD_SCRIPT_VERIFY_FLAGS)
+    _ = println(signedAnchorTx.hash)
+  } yield signedAnchorTx
 
   val result = Await.result(future, 1000 seconds)
+
   println(result)
 }
