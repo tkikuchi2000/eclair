@@ -23,12 +23,20 @@ object Scripts {
 
   def isLess(a: Seq[Byte], b: Seq[Byte]): Boolean = memcmp(a.dropWhile(_ == 0).toList, b.dropWhile(_ == 0).toList) < 0
 
+  def lessThan(outpoint1: OutPoint, outpoint2: OutPoint): Boolean ={
+    if (memcmp(outpoint1.hash, outpoint2.hash) < 0) true else outpoint1.index < outpoint2.index
+  }
+
+  def lessThan(input1: TxIn, input2: TxIn): Boolean = lessThan(input1.outPoint, input2.outPoint)
+
   def lessThan(output1: TxOut, output2: TxOut): Boolean = (output1, output2) match {
     case (TxOut(amount1, script1), TxOut(amount2, script2)) if amount1 == amount2 => memcmp(script1.toList, script2.toList) < 0
     case (TxOut(amount1, _), TxOut(amount2, _)) => amount1.toLong < amount2.toLong
   }
 
   def permuteOutputs(tx: Transaction): Transaction = tx.copy(txOut = tx.txOut.sortWith(lessThan))
+
+  def permuteInputs(tx: Transaction): Transaction = tx.copy(txIn = tx.txIn.sortWith(lessThan))
 
   def multiSig2of2(pubkey1: BinaryData, pubkey2: BinaryData): BinaryData = if (isLess(pubkey1, pubkey2))
     Script.createMultiSigMofN(2, Seq(pubkey1, pubkey2))

@@ -110,7 +110,9 @@ package object eclair {
     case (ha :: ta, hb :: tb) => (ha & 0xff) - (hb & 0xff)
   }
 
-  /**
+  def memcmp(a: BinaryData, b: BinaryData): Int = memcmp(a.toList, b.toList)
+
+    /**
     *
     * A node MUST use the formula 338 + 32 bytes for every non-dust HTLC as the bytecount for calculating commitment
     * transaction fees. Note that the fee requirement is unchanged, even if the elimination of dust HTLC outputs

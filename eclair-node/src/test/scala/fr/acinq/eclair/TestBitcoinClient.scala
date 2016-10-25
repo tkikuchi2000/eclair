@@ -3,6 +3,7 @@ package fr.acinq.eclair
 import akka.actor.ActorSystem
 import fr.acinq.bitcoin.{BinaryData, BitcoinJsonRPCClient, Satoshi, Transaction, TxIn, TxOut}
 import fr.acinq.eclair.blockchain.ExtendedBitcoinClient
+import fr.acinq.eclair.blockchain.ExtendedBitcoinClient.{FundTransactionResponse, SignTransactionResponse}
 import fr.acinq.eclair.blockchain.peer.{NewBlock, NewTransaction}
 import fr.acinq.eclair.channel.Scripts
 
@@ -17,6 +18,7 @@ class TestBitcoinClient()(implicit system: ActorSystem) extends ExtendedBitcoinC
   client.client.close()
 
   import scala.concurrent.ExecutionContext.Implicits.global
+
   system.scheduler.schedule(100 milliseconds, 100 milliseconds, new Runnable {
     override def run(): Unit = system.eventStream.publish(NewBlock(null)) // blocks are not actually interpreted
   })

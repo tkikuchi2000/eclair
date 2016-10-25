@@ -5,7 +5,7 @@
     <parent>
         <groupId>fr.acinq.eclair</groupId>
         <artifactId>eclair_2.11</artifactId>
-        <version>0.2-SNAPSHOT</version>
+        <version>0.2-DUALFUNDING-SNAPSHOT</version>
     </parent>
 
     <artifactId>eclair-node_2.11</artifactId>
@@ -71,6 +71,7 @@
         <dependency>
             <groupId>fr.acinq</groupId>
             <artifactId>bitcoin-lib_${scala.version.short}</artifactId>
+            <version>0.9.7-SNAPSHOT</version>
         </dependency>
         <dependency>
             <groupId>fr.acinq.acinq-tools</groupId>

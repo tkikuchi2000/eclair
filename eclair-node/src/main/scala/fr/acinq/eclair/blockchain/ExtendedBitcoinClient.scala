@@ -13,6 +13,7 @@ import scala.concurrent.{Await, ExecutionContext, Future}
   * Created by PM on 26/04/2016.
   */
 class ExtendedBitcoinClient(val client: BitcoinJsonRPCClient) {
+  import ExtendedBitcoinClient._
 
   implicit val formats = org.json4s.DefaultFormats
 
@@ -56,8 +57,6 @@ class ExtendedBitcoinClient(val client: BitcoinJsonRPCClient) {
   def getTransaction(txId: String)(implicit ec: ExecutionContext): Future[Transaction] =
     getRawTransaction(txId).map(raw => Transaction.read(raw))
 
-  case class FundTransactionResponse(tx: Transaction, changepos: Int, fee: Double)
-
   def fundTransaction(hex: String)(implicit ec: ExecutionContext): Future[FundTransactionResponse] = {
     client.invoke("fundrawtransaction", hex /*hex.take(4) + "0000" + hex.drop(4)*/).map(json => {
       val JString(hex) = json \ "hex"
@@ -69,8 +68,6 @@ class ExtendedBitcoinClient(val client: BitcoinJsonRPCClient) {
 
   def fundTransaction(tx: Transaction)(implicit ec: ExecutionContext): Future[FundTransactionResponse] =
     fundTransaction(tx2Hex(tx))
-
-  case class SignTransactionResponse(tx: Transaction, complete: Boolean)
 
   def signTransaction(hex: String)(implicit ec: ExecutionContext): Future[SignTransactionResponse] =
     client.invoke("signrawtransaction", hex).map(json => {
@@ -154,4 +151,9 @@ class ExtendedBitcoinClient(val client: BitcoinJsonRPCClient) {
   client.invoke("getblockcount") collect {
     case JInt(count) => count.toLong
   }
+}
+
+object ExtendedBitcoinClient {
+  case class FundTransactionResponse(tx: Transaction, changepos: Int, fee: Double)
+  case class SignTransactionResponse(tx: Transaction, complete: Boolean)
 }
