@@ -1,5 +1,6 @@
 package fr.acinq.eclair.blockchain
 
+import akka.actor.Status.Success
 import fr.acinq.bitcoin._
 import fr.acinq.eclair.channel
 import fr.acinq.eclair.channel.Scripts
@@ -13,6 +14,7 @@ import scala.concurrent.{Await, ExecutionContext, Future}
   * Created by PM on 26/04/2016.
   */
 class ExtendedBitcoinClient(val client: BitcoinJsonRPCClient) {
+
   import ExtendedBitcoinClient._
 
   implicit val formats = org.json4s.DefaultFormats
@@ -80,7 +82,7 @@ class ExtendedBitcoinClient(val client: BitcoinJsonRPCClient) {
     signTransaction(tx2Hex(tx))
 
   def publishTransaction(hex: String)(implicit ec: ExecutionContext): Future[String] =
-    client.invoke("sendrawtransaction", hex) collect {
+    client.invoke("sendrawtransaction", hex).map {
       case JString(txid) => txid
     }
 
@@ -154,6 +156,9 @@ class ExtendedBitcoinClient(val client: BitcoinJsonRPCClient) {
 }
 
 object ExtendedBitcoinClient {
+
   case class FundTransactionResponse(tx: Transaction, changepos: Int, fee: Double)
+
   case class SignTransactionResponse(tx: Transaction, complete: Boolean)
+
 }

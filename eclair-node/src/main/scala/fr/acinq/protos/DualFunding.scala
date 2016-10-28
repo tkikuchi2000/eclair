@@ -9,8 +9,11 @@ import fr.acinq.eclair.channel.Helpers._
 import fr.acinq.eclair.channel._
 import fr.acinq.eclair._
 import fr.acinq.eclair.blockchain.ExtendedBitcoinClient.FundTransactionResponse
-import lightning.locktime
+import fr.acinq.eclair.crypto.ShaChain
+import fr.acinq.protos.SegwitFunding.FundingInputs
+import lightning.{locktime, update_commit}
 import lightning.locktime.Locktime.Blocks
+import org.bouncycastle.util.encoders.Hex
 
 /**
   * Alice --- balance, inputs, change outputs --> Bob
@@ -51,24 +54,21 @@ object DualFunding extends App {
 
   sealed trait Message
 
-  case class OpenRequest(balance: Satoshi, publicKey: BinaryData, delay: locktime) extends Message
+  case class OpenRequest(balance: Satoshi, input: TxIn, changeOutputs: Seq[TxOut], commitKey: BinaryData, finalKey: BinaryData, delay: locktime) extends Message
 
-  case class OpenResponse(balance: Satoshi, inputs: Seq[TxIn], changeOutputs: Seq[TxOut], publicKey: BinaryData, delay: locktime) extends Message
+  case class OpenResponse(balance: Satoshi, input: TxIn, changeOutputs: Seq[TxOut], commitKey: BinaryData, finalKey: BinaryData, delay: locktime) extends Message
 
-  case class SignatureRequest(anchorTxId: BinaryData, anchorOutputIndex: Int, commitSig: BinaryData) extends Message
+  case class SignatureRequest(commitSig: BinaryData) extends Message
 
   case class SignatureResponse(fundingSig: BinaryData, commitSig: BinaryData) extends Message
 
   val system = ActorSystem("mySystem")
   val config = ConfigFactory.load()
-  val bitcoin_client = new ExtendedBitcoinClient(new BitcoinJsonRPCClient(
+  val bitcoin = new ExtendedBitcoinClient(new BitcoinJsonRPCClient(
     user = config.getString("eclair.bitcoind.rpcuser"),
     password = config.getString("eclair.bitcoind.rpcpassword"),
     host = config.getString("eclair.bitcoind.host"),
     port = config.getInt("eclair.bitcoind.rpcport")))
-
-  val (_, priv1) = Base58Check.decode("cV5oyXUgySSMcUvKNdKtuYg4t4NTaxkwYrrocgsJZuYac2ogEdZX")
-  val (_, priv2) = Base58Check.decode("cNcttRx29WcftwAwKQESCQX8ZMTVykb1s5Zjpse4D6QCzwKPEL5H")
 
   class Channel(ourParams: OurChannelParams) extends Actor with ActorLogging {
 
@@ -78,70 +78,120 @@ object DualFunding extends App {
 
     def receive = {
       case ('connect, amount: Satoshi, them: ActorRef) =>
-        them ! OpenRequest(amount, ourParams.commitPubKey, ourParams.delay)
-        context become waitingForOpenResponse(amount)
+        SegwitFunding.fundSegwitTx(bitcoin)(amount, ourParams.commitPubKey).map(fundingInputs => {
+          // TODO: publish and confirm
+          bitcoin.publishTransaction(fundingInputs.publishTx)
+          them ! OpenRequest(amount, fundingInputs.input, fundingInputs.changeOutputs, ourParams.commitPubKey, ourParams.finalPubKey, ourParams.delay)
+          context become waitingForOpenResponse(amount, fundingInputs)
+        })
 
-      case theirRequest@OpenRequest(theirBalance, theirPubKey, theirDelay) =>
-        val tx = Transaction(version = 2, txIn = Nil, txOut = TxOut(balance, Script.pay2wpkh(ourParams.commitPubKey)) :: Nil, lockTime = 0)
+      case theirRequest@OpenRequest(theirBalance, theirInputs, theirOutputs, theirCommitKey, theirFinalKey, theirDelay) =>
         val replyTo = sender
-        // ask bitcoind to select inputs and change outputs
-        for {
-          fund <- bitcoin_client.fundTransaction(tx)
-          tx1 = fund.tx
-          change = tx1.txOut(fund.changepos)
-          outputs = change :: Nil
-        } yield {
-          val ourResponse = OpenResponse(balance, tx1.txIn, outputs, ourParams.commitPubKey, ourParams.delay)
+        SegwitFunding.fundSegwitTx(bitcoin)(balance, ourParams.commitPubKey).map(fundingInputs => {
+          // TODO: publish and confirm
+          bitcoin.publishTransaction(fundingInputs.publishTx)
+          val ourResponse = OpenResponse(balance, fundingInputs.input, fundingInputs.changeOutputs, ourParams.commitPubKey, ourParams.finalPubKey, ourParams.delay)
           replyTo ! ourResponse
-          context become waitingForSignatureRequest(theirRequest, ourResponse)
-        }
+          context become waitingForSignatureRequest(theirRequest, fundingInputs)
+        })
     }
 
-    def waitingForOpenResponse(balance: Satoshi): Receive = {
-      case theirResponse@OpenResponse(theirBalance, theirInputs, theirOutputs, theirPub, theirDelay) =>
+    def waitingForOpenResponse(balance: Satoshi, fundingInputs: FundingInputs): Receive = {
+      case theirResponse@OpenResponse(theirBalance, theirInput, theirOutputs, theirCommitKey, theirFinalKey, theirDelay) =>
         // create incomplete anchor tx
-        val anchorAmount = balance + theirBalance
-        val anchorOutput = TxOut(amount = anchorAmount, publicKeyScript = Scripts.anchorPubkeyScript(ourParams.commitPubKey, theirPub))
+        val anchorAmount = balance + theirBalance - Satoshi(2000)
+        val anchorOutput = TxOut(amount = anchorAmount, publicKeyScript = Scripts.anchorPubkeyScript(ourParams.commitPubKey, theirCommitKey))
 
         val tx = Transaction(version = 2,
-          txIn = theirInputs,
-          txOut = anchorOutput +: theirOutputs,
+          txIn = fundingInputs.input :: theirInput :: Nil,
+          txOut = anchorOutput :: Nil, // +: (fundingInputs.changeOutputs ++ theirOutputs),
           lockTime = 0)
-        // it is not complete because it is missing our inputs and change outputs
-
-        bitcoin_client.fundTransaction(tx).pipeTo(self)
-        context become waitingForAnchor(sender, theirResponse, anchorOutput)
-    }
-
-    def waitingForAnchor(them: ActorRef, theirResponse: OpenResponse, anchorOutput: TxOut): Receive = {
-      case FundTransactionResponse(tx, changepos, fee) =>
-        // tx has our inputs and their inputs
         val anchorTx = Scripts.permuteInputs(Scripts.permuteOutputs(tx))
         val index = anchorTx.txOut.indexOf(anchorOutput)
-        val theirParams = TheirChannelParams(theirResponse.delay, theirResponse.publicKey, theirResponse.publicKey, Some(1), 100)
+        log.info(s"creating anchor tx ${anchorTx.txid}")
 
-        val ourSpec = CommitmentSpec(Set.empty[Htlc], feeRate = 0, amount_them_msat = theirResponse.balance.amount * 1000, amount_us_msat = 0)
-        val theirSpec = CommitmentSpec(Set.empty[Htlc], feeRate = 0, amount_them_msat = theirResponse.balance.amount * 1000, amount_us_msat = balance.amount * 1000)
-        val theirTx = makeTheirTx(ourParams, theirParams, TxIn(OutPoint(tx.hash, index), Array.emptyByteArray, 0xffffffffL) :: Nil, Hash.Zeroes, theirSpec)
+        val theirParams = TheirChannelParams(theirResponse.delay, theirResponse.commitKey, theirResponse.finalKey, Some(1), 100)
+        val theirSpec = CommitmentSpec(Set.empty[Htlc], feeRate = 0, amount_them_msat = balance.amount * 1000, amount_us_msat = theirResponse.balance.amount * 1000)
+        val theirTx = makeTheirTx(ourParams, theirParams, TxIn(OutPoint(anchorTx, index), Array.emptyByteArray, 0xffffffffL) :: Nil, Hash.Zeroes, theirSpec)
+        log.info(s"signing their tx: $theirTx")
         val ourSigForThem = sign(ourParams, theirParams, anchorOutput.amount, theirTx)
-        them ! SignatureRequest(tx.txid, index, ourSigForThem)
-        context become waitingForSignatureResponse()
+        val theirRevocationHash = Hash.Zeroes
+        val theirNextRevocationHash = Hash.Zeroes
+
+        val ourSpec = CommitmentSpec(Set.empty[Htlc], feeRate = 0, amount_them_msat = theirResponse.balance.amount * 1000, amount_us_msat = balance.amount * 1000)
+        val ourRevocationHash = Hash.Zeroes
+        val ourTx = makeOurTx(ourParams, theirParams, TxIn(OutPoint(anchorTx, index), Array.emptyByteArray, 0xffffffffL) :: Nil, ourRevocationHash, ourSpec)
+
+        val commitments = Commitments(ourParams, theirParams,
+          OurCommit(0, ourSpec, ourTx), TheirCommit(0, theirSpec, theirTx.txid, theirRevocationHash),
+          fr.acinq.eclair.channel.OurChanges(Nil, Nil, Nil), fr.acinq.eclair.channel.TheirChanges(Nil, Nil), 0L,
+          Right(theirNextRevocationHash), anchorOutput, ShaChain.init, new BasicTxDb)
+
+        sender ! SignatureRequest(ourSigForThem)
+        context become waitingForSignatureResponse(commitments, fundingInputs, anchorTx, theirInput)
     }
 
-    def waitingForSignatureResponse(): Receive = ???
+    def waitingForSignatureResponse(commitments: Commitments, fundingInputs: FundingInputs, anchorTx: Transaction, theirInput: TxIn): Receive = {
+      case SignatureResponse(theirFundingSig, theirSigForUs) =>
+        log.info(s"checking their signature for the anchor tx")
+        val ourInputIndex = anchorTx.txIn.indexOf(fundingInputs.input)
+        val fundingSig = Transaction.signInput(anchorTx, ourInputIndex, Script.pay2pkh(ourParams.commitPubKey), SIGHASH_ANYONECANPAY | SIGHASH_ALL, fundingInputs.amount, 1, ourParams.commitPrivKey)
+        val theirInputIndex = anchorTx.txIn.indexOf(theirInput)
+        val signedAnchorTx = anchorTx
+          .updateWitness(ourInputIndex, ScriptWitness(fundingSig :: ourParams.commitPubKey :: Nil))
+          .updateWitness(theirInputIndex, ScriptWitness(theirFundingSig :: commitments.theirParams.commitPubKey :: Nil))
+        println(s"anchor tx: ${Hex.toHexString(Transaction.write(signedAnchorTx).toArray)}")
+        bitcoin.publishTransaction(signedAnchorTx).map(txid => {
+          log.info(s"anchor published with id $txid")
+        }).onFailure {
+          case t: Throwable => log.error(s"cannot publish anchor tx", t)
+        }
 
-    def waitingForSignatureRequest(theirRequest: OpenRequest, ourResponse: OpenResponse): Receive = {
-      case SignatureRequest(anchorTxId, anchorOutputIndex, ourCommitSig) =>
-        val anchorAmount = theirRequest.balance + ourResponse.balance
-        val anchorOutput = TxOut(amount = anchorAmount, publicKeyScript = Scripts.anchorPubkeyScript(ourParams.commitPubKey, theirRequest.publicKey))
-        val anchorTx = Transaction(version = 2,
-          txIn = ourResponse.inputs,
-          txOut = anchorOutput +: ourResponse.changeOutputs,
+        log.info(s"checking their signature for our tx ${commitments.ourCommit.publishableTx}")
+        val ourSig = Helpers.sign(ourParams, commitments.theirParams, commitments.anchorOutput.amount, commitments.ourCommit.publishableTx)
+        val signedTx = Helpers.addSigs(ourParams, commitments.theirParams, commitments.anchorOutput.amount, commitments.ourCommit.publishableTx, ourSig, theirSigForUs)
+        Helpers.checksig(ourParams, commitments.theirParams, commitments.anchorOutput, signedTx).get
+    }
+
+    def waitingForSignatureRequest(theirRequest: OpenRequest, fundingInputs: FundingInputs): Receive = {
+      case SignatureRequest(theirSigForUs) =>
+        val anchorAmount = theirRequest.balance + balance - Satoshi(2000)
+        val anchorOutput = TxOut(amount = anchorAmount, publicKeyScript = Scripts.anchorPubkeyScript(ourParams.commitPubKey, theirRequest.commitKey))
+
+        val tx = Transaction(version = 2,
+          txIn = fundingInputs.input :: theirRequest.input :: Nil,
+          txOut = anchorOutput :: Nil, // +: (fundingInputs.changeOutputs ++ theirRequest.changeOutputs),
           lockTime = 0)
 
+        val anchorTx = Scripts.permuteInputs(Scripts.permuteOutputs(tx))
+        val index = anchorTx.txOut.indexOf(anchorOutput)
+        log.info(s"creating anchor tx ${anchorTx.txid}")
+        val theirParams = TheirChannelParams(theirRequest.delay, theirRequest.commitKey, theirRequest.finalKey, Some(1), 100)
+        val theirSpec = CommitmentSpec(Set.empty[Htlc], feeRate = 0, amount_them_msat = balance.amount * 1000, amount_us_msat = theirRequest.balance.amount * 1000)
+        val theirTx = makeTheirTx(ourParams, theirParams, TxIn(OutPoint(anchorTx, index), Array.emptyByteArray, 0xffffffffL) :: Nil, Hash.Zeroes, theirSpec)
+        val ourSigForThem = sign(ourParams, theirParams, anchorOutput.amount, theirTx)
+        val theirRevocationHash = Hash.Zeroes
+        val theirNextRevocationHash = Hash.Zeroes
+
+        val ourSpec = CommitmentSpec(Set.empty[Htlc], feeRate = 0, amount_them_msat = theirRequest.balance.amount * 1000, amount_us_msat = balance.amount * 1000)
+        val ourRevocationHash = Hash.Zeroes
+        val ourTx = makeOurTx(ourParams, theirParams, TxIn(OutPoint(anchorTx, index), Array.emptyByteArray, 0xffffffffL) :: Nil, ourRevocationHash, ourSpec)
+
+        val ourSig = Helpers.sign(ourParams, theirParams, anchorOutput.amount, ourTx)
+        val signedTx = Helpers.addSigs(ourParams, theirParams, anchorOutput.amount, ourTx, ourSig, theirSigForUs)
+        Helpers.checksig(ourParams, theirParams, anchorOutput, signedTx).get
+
+        val commitments = Commitments(ourParams, theirParams,
+          OurCommit(0, ourSpec, ourTx), TheirCommit(0, theirSpec, theirTx.txid, theirRevocationHash),
+          fr.acinq.eclair.channel.OurChanges(Nil, Nil, Nil), fr.acinq.eclair.channel.TheirChanges(Nil, Nil), 0L,
+          Right(theirNextRevocationHash), anchorOutput, ShaChain.init, new BasicTxDb)
+
+        val ourInputIndex = anchorTx.txIn.indexOf(fundingInputs.input)
+        val fundingSig = Transaction.signInput(anchorTx, ourInputIndex, Script.pay2pkh(ourParams.commitPubKey), SIGHASH_ANYONECANPAY | SIGHASH_ALL, fundingInputs.amount, 1, ourParams.commitPrivKey)
+
+        sender ! SignatureResponse(fundingSig, ourSigForThem)
     }
   }
-
 
   val a = system.actorOf(Props(new Channel(Alice.channelParams)), "Alice")
   val b = system.actorOf(Props(new Channel(Bob.channelParams)), "Bob")

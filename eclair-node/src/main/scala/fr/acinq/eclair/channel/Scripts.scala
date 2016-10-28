@@ -23,7 +23,7 @@ object Scripts {
 
   def isLess(a: Seq[Byte], b: Seq[Byte]): Boolean = memcmp(a.dropWhile(_ == 0).toList, b.dropWhile(_ == 0).toList) < 0
 
-  def lessThan(outpoint1: OutPoint, outpoint2: OutPoint): Boolean ={
+  def lessThan(outpoint1: OutPoint, outpoint2: OutPoint): Boolean = {
     if (memcmp(outpoint1.hash, outpoint2.hash) < 0) true else outpoint1.index < outpoint2.index
   }
 
@@ -121,9 +121,9 @@ object Scripts {
     // @formatter:off
     OP_HASH160 :: OP_PUSHDATA(ripemd160(hashOfSecret)) :: OP_EQUAL ::
     OP_IF ::
-    OP_PUSHDATA(keyIfSecretKnown) ::
+      OP_PUSHDATA(keyIfSecretKnown) ::
     OP_ELSE ::
-    OP_PUSHDATA(encodeNumber(reltimeout)) :: OP_CHECKSEQUENCEVERIFY :: OP_DROP :: OP_PUSHDATA(delayedKey) ::
+      OP_PUSHDATA(encodeNumber(reltimeout)) :: OP_CHECKSEQUENCEVERIFY :: OP_DROP :: OP_PUSHDATA(delayedKey) ::
     OP_ENDIF ::
     OP_CHECKSIG :: Nil
     // @formatter:on
@@ -138,9 +138,9 @@ object Scripts {
     OP_PUSHDATA(ripemd160(rhash)) :: OP_EQUAL ::
     OP_SWAP :: OP_PUSHDATA(ripemd160(commit_revoke)) :: OP_EQUAL :: OP_ADD ::
     OP_IF ::
-    OP_PUSHDATA(theirkey) ::
+      OP_PUSHDATA(theirkey) ::
     OP_ELSE ::
-    OP_PUSHDATA(encodeNumber(abstimeout)) :: OP_CHECKLOCKTIMEVERIFY :: OP_PUSHDATA(encodeNumber(reltimeout)) :: OP_CHECKSEQUENCEVERIFY :: OP_2DROP :: OP_PUSHDATA(ourkey) ::
+      OP_PUSHDATA(encodeNumber(abstimeout)) :: OP_CHECKLOCKTIMEVERIFY :: OP_PUSHDATA(encodeNumber(reltimeout)) :: OP_CHECKSEQUENCEVERIFY :: OP_2DROP :: OP_PUSHDATA(ourkey) ::
     OP_ENDIF ::
     OP_CHECKSIG :: Nil
     // @formatter:on
@@ -151,18 +151,18 @@ object Scripts {
     assert(abstimeout > 16, s"abstimeout=$abstimeout must be greater than 16")
     // @formatter:off
     OP_SIZE :: OP_PUSHDATA(encodeNumber(32)) :: OP_EQUALVERIFY ::
-      OP_HASH160 :: OP_DUP ::
-      OP_PUSHDATA(ripemd160(rhash)) :: OP_EQUAL ::
-      OP_IF ::
+    OP_HASH160 :: OP_DUP ::
+    OP_PUSHDATA(ripemd160(rhash)) :: OP_EQUAL ::
+    OP_IF ::
       OP_PUSHDATA(encodeNumber(reltimeout)) :: OP_CHECKSEQUENCEVERIFY :: OP_2DROP :: OP_PUSHDATA(ourkey) ::
-      OP_ELSE ::
+    OP_ELSE ::
       OP_PUSHDATA(ripemd160(commit_revoke)) :: OP_EQUAL ::
       OP_NOTIF ::
-      OP_PUSHDATA(encodeNumber(abstimeout)) :: OP_CHECKLOCKTIMEVERIFY :: OP_DROP ::
+        OP_PUSHDATA(encodeNumber(abstimeout)) :: OP_CHECKLOCKTIMEVERIFY :: OP_DROP ::
       OP_ENDIF ::
       OP_PUSHDATA(theirkey) ::
-      OP_ENDIF ::
-      OP_CHECKSIG :: Nil
+    OP_ENDIF ::
+    OP_CHECKSIG :: Nil
     // @formatter:on
   }
 
