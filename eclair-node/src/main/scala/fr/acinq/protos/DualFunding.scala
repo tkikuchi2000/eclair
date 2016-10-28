@@ -75,6 +75,7 @@ object DualFunding extends App {
     import scala.concurrent.ExecutionContext.Implicits.global
 
     val balance = 10000 satoshi
+    val fee = 1000 satoshi
 
     def receive = {
       case ('connect, amount: Satoshi, them: ActorRef) =>
@@ -99,26 +100,28 @@ object DualFunding extends App {
     def waitingForOpenResponse(balance: Satoshi, fundingInputs: FundingInputs): Receive = {
       case theirResponse@OpenResponse(theirBalance, theirInput, theirOutputs, theirCommitKey, theirFinalKey, theirDelay) =>
         // create incomplete anchor tx
-        val anchorAmount = balance + theirBalance - Satoshi(2000)
+        val balance1 = balance - fee
+        val theirBalance1 = theirBalance - fee
+        val anchorAmount = balance1 + theirBalance1
         val anchorOutput = TxOut(amount = anchorAmount, publicKeyScript = Scripts.anchorPubkeyScript(ourParams.commitPubKey, theirCommitKey))
 
         val tx = Transaction(version = 2,
           txIn = fundingInputs.input :: theirInput :: Nil,
-          txOut = anchorOutput :: Nil, // +: (fundingInputs.changeOutputs ++ theirOutputs),
+          txOut = anchorOutput :: Nil,
           lockTime = 0)
         val anchorTx = Scripts.permuteInputs(Scripts.permuteOutputs(tx))
         val index = anchorTx.txOut.indexOf(anchorOutput)
         log.info(s"creating anchor tx ${anchorTx.txid}")
 
         val theirParams = TheirChannelParams(theirResponse.delay, theirResponse.commitKey, theirResponse.finalKey, Some(1), 100)
-        val theirSpec = CommitmentSpec(Set.empty[Htlc], feeRate = 0, amount_them_msat = balance.amount * 1000, amount_us_msat = theirResponse.balance.amount * 1000)
+        val theirSpec = CommitmentSpec(Set.empty[Htlc], feeRate = 0, amount_them_msat = balance1.amount * 1000, amount_us_msat = theirBalance1.amount * 1000)
         val theirTx = makeTheirTx(ourParams, theirParams, TxIn(OutPoint(anchorTx, index), Array.emptyByteArray, 0xffffffffL) :: Nil, Hash.Zeroes, theirSpec)
         log.info(s"signing their tx: $theirTx")
         val ourSigForThem = sign(ourParams, theirParams, anchorOutput.amount, theirTx)
         val theirRevocationHash = Hash.Zeroes
         val theirNextRevocationHash = Hash.Zeroes
 
-        val ourSpec = CommitmentSpec(Set.empty[Htlc], feeRate = 0, amount_them_msat = theirResponse.balance.amount * 1000, amount_us_msat = balance.amount * 1000)
+        val ourSpec = CommitmentSpec(Set.empty[Htlc], feeRate = 0, amount_them_msat = theirBalance1.amount * 1000, amount_us_msat = balance1.amount * 1000)
         val ourRevocationHash = Hash.Zeroes
         val ourTx = makeOurTx(ourParams, theirParams, TxIn(OutPoint(anchorTx, index), Array.emptyByteArray, 0xffffffffL) :: Nil, ourRevocationHash, ourSpec)
 
@@ -144,7 +147,7 @@ object DualFunding extends App {
         bitcoin.publishTransaction(signedAnchorTx).map(txid => {
           log.info(s"anchor published with id $txid")
         }).onFailure {
-          case t: Throwable => log.error(s"cannot publish anchor tx", t)
+          case t: Throwable => log.error(t, "cannot publish anchor tx")
         }
 
         log.info(s"checking their signature for our tx ${commitments.ourCommit.publishableTx}")
@@ -155,25 +158,27 @@ object DualFunding extends App {
 
     def waitingForSignatureRequest(theirRequest: OpenRequest, fundingInputs: FundingInputs): Receive = {
       case SignatureRequest(theirSigForUs) =>
-        val anchorAmount = theirRequest.balance + balance - Satoshi(2000)
+        val balance1 = balance - fee
+        val theirBalance1 = theirRequest.balance - fee
+        val anchorAmount = theirBalance1 + balance1
         val anchorOutput = TxOut(amount = anchorAmount, publicKeyScript = Scripts.anchorPubkeyScript(ourParams.commitPubKey, theirRequest.commitKey))
 
         val tx = Transaction(version = 2,
           txIn = fundingInputs.input :: theirRequest.input :: Nil,
-          txOut = anchorOutput :: Nil, // +: (fundingInputs.changeOutputs ++ theirRequest.changeOutputs),
+          txOut = anchorOutput :: Nil,
           lockTime = 0)
 
         val anchorTx = Scripts.permuteInputs(Scripts.permuteOutputs(tx))
         val index = anchorTx.txOut.indexOf(anchorOutput)
         log.info(s"creating anchor tx ${anchorTx.txid}")
         val theirParams = TheirChannelParams(theirRequest.delay, theirRequest.commitKey, theirRequest.finalKey, Some(1), 100)
-        val theirSpec = CommitmentSpec(Set.empty[Htlc], feeRate = 0, amount_them_msat = balance.amount * 1000, amount_us_msat = theirRequest.balance.amount * 1000)
+        val theirSpec = CommitmentSpec(Set.empty[Htlc], feeRate = 0, amount_them_msat = balance1.amount * 1000, amount_us_msat = theirBalance1.amount * 1000)
         val theirTx = makeTheirTx(ourParams, theirParams, TxIn(OutPoint(anchorTx, index), Array.emptyByteArray, 0xffffffffL) :: Nil, Hash.Zeroes, theirSpec)
         val ourSigForThem = sign(ourParams, theirParams, anchorOutput.amount, theirTx)
         val theirRevocationHash = Hash.Zeroes
         val theirNextRevocationHash = Hash.Zeroes
 
-        val ourSpec = CommitmentSpec(Set.empty[Htlc], feeRate = 0, amount_them_msat = theirRequest.balance.amount * 1000, amount_us_msat = balance.amount * 1000)
+        val ourSpec = CommitmentSpec(Set.empty[Htlc], feeRate = 0, amount_them_msat = theirBalance1.amount * 1000, amount_us_msat = balance1.amount * 1000)
         val ourRevocationHash = Hash.Zeroes
         val ourTx = makeOurTx(ourParams, theirParams, TxIn(OutPoint(anchorTx, index), Array.emptyByteArray, 0xffffffffL) :: Nil, ourRevocationHash, ourSpec)
 
