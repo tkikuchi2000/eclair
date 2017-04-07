@@ -1,6 +1,6 @@
 package fr.acinq.eclair.channel
 
-import akka.actor.{ActorRef, FSM, LoggingFSM, OneForOneStrategy, Props, SupervisorStrategy}
+import akka.actor.{ActorRef, FSM, LoggingFSM, OneForOneStrategy, Props, SupervisorStrategy, Terminated}
 import fr.acinq.bitcoin.Crypto.{PrivateKey, PublicKey}
 import fr.acinq.bitcoin._
 import fr.acinq.eclair._
@@ -29,6 +29,7 @@ object Channel {
 class Channel(val nodeParams: NodeParams, remoteNodeId: PublicKey, blockchain: ActorRef, router: ActorRef, relayer: ActorRef)(implicit ec: ExecutionContext = ExecutionContext.Implicits.global) extends LoggingFSM[State, Data] {
 
   val forwarder = context.actorOf(Props(new Forwarder(nodeParams)), "forwarder")
+  var listener: Option[ActorRef] = None
 
   /*
           8888888 888b    888 8888888 88888888888
@@ -425,7 +426,9 @@ class Channel(val nodeParams: NodeParams, remoteNodeId: PublicKey, blockchain: A
 
     case Event(add: UpdateAddHtlc, d@DATA_NORMAL(commitments, _)) =>
       Try(Commitments.receiveAdd(commitments, add)) match {
-        case Success(commitments1) => goto(stateName) using d.copy(commitments = commitments1)
+        case Success(commitments1) =>
+          listener.map(l => l ! add)
+          goto(stateName) using d.copy(commitments = commitments1)
         case Failure(cause) => handleLocalError(cause, d)
       }
 
@@ -440,6 +443,7 @@ class Channel(val nodeParams: NodeParams, remoteNodeId: PublicKey, blockchain: A
     case Event(fulfill@UpdateFulfillHtlc(_, id, r), d@DATA_NORMAL(commitments, _)) =>
       Try(Commitments.receiveFulfill(d.commitments, fulfill)) match {
         case Success(Right(commitments1)) =>
+          listener.map(l => l ! fulfill)
           relayer ! ForwardFulfill(fulfill)
           goto(stateName) using d.copy(commitments = commitments1)
         case Success(Left(_)) => goto(stateName)
@@ -988,6 +992,24 @@ class Channel(val nodeParams: NodeParams, remoteNodeId: PublicKey, blockchain: A
 
     // we only care about this event in NORMAL and SHUTDOWN state, and we never unregister to the event stream
     case Event(CurrentBlockCount(_), _) => stay
+
+    case Event('ping, _) =>
+      sender ! 'pong
+      stay
+
+    case Event('setListener, _) =>
+      listener = Some(sender)
+      context.watch(sender)
+      log.info(s"adding listener $sender")
+      sender ! 'ok
+      stay()
+
+    case Event(Terminated(actor), _) if listener == Some(actor) =>
+      // this can be the connection or the listener, either way it is a cause of death
+      log.info(s"lost listener $actor")
+      listener = None
+      stay()
+
   }
 
   onTransition {
