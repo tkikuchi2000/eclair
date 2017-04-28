@@ -89,7 +89,7 @@ object NodeParams {
       address = new InetSocketAddress(config.getString("server.public-ip"), config.getInt("server.port")),
       globalFeatures = BinaryData(""),
       localFeatures = BinaryData("05"), // channels_public and initial_routing_sync
-      dustLimitSatoshis = 542,
+      dustLimitSatoshis = 54600,
       maxHtlcValueInFlightMsat = Long.MaxValue,
       maxAcceptedHtlcs = 100,
       expiryDeltaBlocks = config.getInt("expiry-delta-blocks"),

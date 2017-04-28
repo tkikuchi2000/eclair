@@ -82,6 +82,7 @@ class Setup(datadir: String, actorSystemName: String = "default") extends Loggin
   val (chain, blockCount, progress) = Try(Await.result(bitcoinClient.client.invoke("getblockchaininfo").map(json => ((json \ "chain").extract[String], (json \ "blocks").extract[Long], (json \ "verificationprogress").extract[Double])), 10 seconds)).recover { case _ => throw BitcoinRPCConnectionException }.get
   logger.info(s"using chain=$chain")
   val chainHash = chain match {
+    case "main" => Block.LivenetGenesisBlock.blockId
     case "test" => Block.TestnetGenesisBlock.blockId
     case "regtest" => Block.RegtestGenesisBlock.blockId
     case _ => throw new RuntimeException("only regtest and testnet are supported for now")
