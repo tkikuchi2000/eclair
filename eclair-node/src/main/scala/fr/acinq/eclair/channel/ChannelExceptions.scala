@@ -15,7 +15,7 @@ case object HtlcTimedout extends ChannelException(s"one or more htlcs timed out"
 case class FeerateTooDifferent(localFeeratePerKw: Long, remoteFeeratePerKw: Long) extends ChannelException(s"local/remote feerates are too different: remoteFeeratePerKw=$remoteFeeratePerKw localFeeratePerKw=$localFeeratePerKw")
 case object InvalidCloseSignature extends ChannelException("cannot verify their close signature")
 case object InvalidCommitmentSignature extends ChannelException("invalid commitment signature")
-case class ForcedLocalCommit(reason: String) extends ChannelException(s"forced local commit: reason")
+case class ForcedLocalCommit(reason: String) extends ChannelException(s"forced local commit: reason=$reason")
 case class UnexpectedHtlcId(expected: Long, actual: Long) extends ChannelException(s"unexpected htlc id: expected=$expected actual=$actual")
 case class ExpiryTooSmall(minimum: Long, actual: Long, blockCount: Long) extends ChannelException(s"expiry too small: required=$minimum actual=$actual blockCount=$blockCount")
 case class ExpiryCannotBeInThePast(expiry: Long, blockCount: Long) extends ChannelException(s"expiry can't be in the past: expiry=$expiry blockCount=$blockCount")
