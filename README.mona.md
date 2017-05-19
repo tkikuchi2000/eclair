@@ -2,7 +2,11 @@
 
 [eclair](https://github.com/ACINQ/eclair)をmonaのmainnetで動くようにしたものです。
 
-zeromqが有効化されたmonacoin coreが必要です。
+zeromq機能が有効化されたmonacoin coreが必要です。
+
+windows版の公式バイナリではzeromqが有効になっていません。以下の非公式バージョンを使ってください。
+
+https://github.com/monapu/monacoin/releases/tag/monacoin-0.13-zeromq-win
 
 ## 設定方法
 
