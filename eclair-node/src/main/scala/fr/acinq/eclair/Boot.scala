@@ -12,7 +12,7 @@ import ch.qos.logback.classic.spi.ILoggingEvent
 import ch.qos.logback.classic.{Logger, LoggerContext}
 import ch.qos.logback.core.FileAppender
 import com.sun.javafx.application.LauncherImpl
-import fr.acinq.bitcoin.{Base58Check, Block, OP_CHECKSIG, OP_DUP, OP_EQUALVERIFY, OP_HASH160, OP_PUSHDATA, Script}
+import fr.acinq.bitcoin.{Base58Check, BinaryData, Block, OP_CHECKSIG, OP_DUP, OP_EQUALVERIFY, OP_HASH160, OP_PUSHDATA, Script}
 import fr.acinq.eclair.api.Service
 import fr.acinq.eclair.blockchain.rpc.BitcoinJsonRPCClient
 import fr.acinq.eclair.blockchain.zmq.ZMQActor
@@ -27,6 +27,7 @@ import grizzled.slf4j.Logging
 import org.json4s.JsonAST.JString
 import org.slf4j.LoggerFactory
 
+import scala.compat.Platform
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Promise}
 import scala.util.Try
@@ -67,6 +68,10 @@ class Setup(datadir: String, actorSystemName: String = "default") extends Loggin
   logger.info(s"version=${getClass.getPackage.getImplementationVersion} commit=${getClass.getPackage.getSpecificationVersion}")
   val config = NodeParams.loadConfiguration(new File(datadir))
 
+  logger.info(s"initializing secure random generator")
+  // this will force the secure random instance to initialize itself right now, making sure it doesn't hang later (see comment in package.scala)
+  secureRandom.nextInt()
+
   implicit lazy val system = ActorSystem(actorSystemName)
   implicit val materializer = ActorMaterializer()
   implicit val timeout = Timeout(30 seconds)
@@ -79,12 +84,18 @@ class Setup(datadir: String, actorSystemName: String = "default") extends Loggin
 
   implicit val formats = org.json4s.DefaultFormats
   implicit val ec = ExecutionContext.Implicits.global
-  val (chain, blockCount, progress) = Try(Await.result(bitcoinClient.client.invoke("getblockchaininfo").map(json => ((json \ "chain").extract[String], (json \ "blocks").extract[Long], (json \ "verificationprogress").extract[Double])), 10 seconds)).recover { case _ => throw BitcoinRPCConnectionException }.get
-  logger.info(s"using chain=$chain")
-  val chainHash = chain match {
-    case "main" => Block.LivenetGenesisBlock.blockId
-    case "test" => Block.TestnetGenesisBlock.blockId
-    case "regtest" => Block.RegtestGenesisBlock.blockId
+
+  val future = for {
+    json <- bitcoinClient.client.invoke("getblockchaininfo")
+    chain = (json \ "chain").extract[String]
+    blockCount = (json \ "blocks").extract[Long]
+    progress = (json \ "verificationprogress").extract[Double]
+    chainHash <- bitcoinClient.client.invoke("getblockhash", 0).map(_.extract[String])
+  } yield (chain, blockCount, progress, chainHash)
+  val (chain, blockCount, progress, chainHash) = Try(Await.result(future, 10 seconds)).recover { case _ => throw BitcoinRPCConnectionException }.get
+  logger.info(s"using chain=$chain chainHash=$chainHash")
+  chain match {
+    case "test" | "regtest" | "main" => ()
     case _ => throw new RuntimeException("only regtest and testnet are supported for now")
   }
   val nodeParams = NodeParams.makeNodeParams(new File(datadir), config, chainHash)
@@ -145,6 +156,10 @@ class Setup(datadir: String, actorSystemName: String = "default") extends Loggin
       nodeParams.announcementsDb.values.collect { case ann: ChannelAnnouncement => router ! ann }
       nodeParams.announcementsDb.values.collect { case ann: NodeAnnouncement => router ! ann }
       nodeParams.announcementsDb.values.collect { case ann: ChannelUpdate => router ! ann }
+      if (nodeParams.channelsDb.values.size > 0) {
+        val nodeAnn = Announcements.makeNodeAnnouncement(nodeParams.privateKey, nodeParams.alias, nodeParams.color, nodeParams.address :: Nil, Platform.currentTime / 1000)
+        router ! nodeAnn
+      }
     }
   })
 

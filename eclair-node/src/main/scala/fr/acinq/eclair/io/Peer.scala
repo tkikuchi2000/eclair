@@ -2,19 +2,18 @@ package fr.acinq.eclair.io
 
 import java.net.InetSocketAddress
 
-import akka.actor.{ActorRef, LoggingFSM, OneForOneStrategy, PoisonPill, Props, SupervisorStrategy, Terminated}
+import akka.actor.{ActorRef, FSM, LoggingFSM, OneForOneStrategy, PoisonPill, Props, SupervisorStrategy, Terminated}
 import fr.acinq.bitcoin.Crypto.{PrivateKey, PublicKey}
 import fr.acinq.bitcoin.{BinaryData, Crypto, DeterministicWallet}
 import fr.acinq.eclair.channel._
 import fr.acinq.eclair.crypto.TransportHandler.{HandshakeCompleted, Listener}
 import fr.acinq.eclair.io.Switchboard.{NewChannel, NewConnection}
-import fr.acinq.eclair.router.Router.Rebroadcast
-import fr.acinq.eclair.router.SendRoutingState
+import fr.acinq.eclair.router.{Rebroadcast, SendRoutingState}
 import fr.acinq.eclair.wire._
-import fr.acinq.eclair.{Features, Globals, NodeParams}
+import fr.acinq.eclair._
 
-import scala.util.Random
 import scala.concurrent.duration._
+import scala.util.Random
 
 // @formatter:off
 
@@ -23,12 +22,16 @@ case object Disconnect
 
 sealed trait OfflineChannel
 case class BrandNewChannel(c: NewChannel) extends OfflineChannel
-case class HotChannel(channelId: BinaryData, a: ActorRef) extends OfflineChannel
+case class HotChannel(channelId: ChannelId, a: ActorRef) extends OfflineChannel
+
+sealed trait ChannelId
+case class TemporaryChannelId(id: BinaryData) extends ChannelId
+case class FinalChannelId(id: BinaryData) extends ChannelId
 
 sealed trait Data
-case class DisconnectedData(offlineChannels: Seq[OfflineChannel]) extends Data
-case class InitializingData(transport: ActorRef, offlineChannels: Seq[OfflineChannel]) extends Data
-case class ConnectedData(transport: ActorRef, remoteInit: Init, channels: Map[BinaryData, ActorRef]) extends Data
+case class DisconnectedData(offlineChannels: Set[OfflineChannel]) extends Data
+case class InitializingData(transport: ActorRef, offlineChannels: Set[OfflineChannel]) extends Data
+case class ConnectedData(transport: ActorRef, remoteInit: Init, channels: Map[ChannelId, ActorRef]) extends Data
 
 sealed trait State
 case object DISCONNECTED extends State
@@ -45,21 +48,25 @@ case class PeerRecord(id: PublicKey, address: InetSocketAddress)
 class Peer(nodeParams: NodeParams, remoteNodeId: PublicKey, address_opt: Option[InetSocketAddress], watcher: ActorRef, router: ActorRef, relayer: ActorRef, defaultFinalScriptPubKey: BinaryData) extends LoggingFSM[State, Data] {
 
   import Peer._
-  import scala.concurrent.ExecutionContext.Implicits.global
 
-  startWith(DISCONNECTED, DisconnectedData(Nil), if (nodeParams.autoReconnect) Some(3 seconds) else None)
+  startWith(DISCONNECTED, DisconnectedData(Set.empty))
 
   when(DISCONNECTED, stateTimeout = if (nodeParams.autoReconnect) 60 seconds else null) {
     case Event(state: HasCommitments, d@DisconnectedData(offlineChannels)) =>
       val channel = spawnChannel(nodeParams, context.system.deadLetters)
       channel ! INPUT_RESTORED(state)
-      stay using d.copy(offlineChannels = offlineChannels :+ HotChannel(state.channelId, channel))
+      self ! Reconnect
+      stay using d.copy(offlineChannels = offlineChannels + HotChannel(FinalChannelId(state.channelId), channel))
 
     case Event(c: NewChannel, d@DisconnectedData(offlineChannels)) =>
-      stay using d.copy(offlineChannels = offlineChannels :+ BrandNewChannel(c))
+      self ! Reconnect
+      stay using d.copy(offlineChannels = offlineChannels + BrandNewChannel(c))
 
-    case Event(Reconnect, _) if address_opt.isDefined =>
-      context.parent forward NewConnection(remoteNodeId, address_opt.get, None)
+    case Event(Reconnect, _) =>
+      address_opt match {
+        case Some(address) => context.parent forward NewConnection(remoteNodeId, address, None)
+        case None => {}
+      }
       stay
 
     case Event(HandshakeCompleted(transport, _), DisconnectedData(offlineChannels)) =>
@@ -69,31 +76,35 @@ class Peer(nodeParams: NodeParams, remoteNodeId: PublicKey, address_opt: Option[
       transport ! Init(globalFeatures = nodeParams.globalFeatures, localFeatures = nodeParams.localFeatures)
       goto(INITIALIZING) using InitializingData(transport, offlineChannels)
 
-    case Event(Terminated(actor), d@DisconnectedData(offlineChannels)) if offlineChannels.collectFirst { case h: HotChannel if h.a == actor => h }.isDefined =>
-      val h = offlineChannels.collectFirst { case h: HotChannel if h.a == actor => h }.toSeq
-      stay using d.copy(offlineChannels = offlineChannels diff h)
+    case Event(Terminated(actor), d@DisconnectedData(offlineChannels)) if offlineChannels.collect { case h: HotChannel if h.a == actor => h }.size >= 0 =>
+      val h = offlineChannels.collect { case h: HotChannel if h.a == actor => h }
+      log.info(s"channel closed: channelId=${h.map(_.channelId).mkString("/")}")
+      stay using d.copy(offlineChannels = offlineChannels -- h)
 
-    case Event(Rebroadcast(_), _) => stay // ignored
+    case Event(_: Rebroadcast, _) => stay // ignored
 
     case Event("connected", _) => stay // ignored
 
-    case Event(StateTimeout, d: DisconnectedData) if d.offlineChannels.size == 0 => stay // ignored
+    case Event(StateTimeout, d: DisconnectedData) if d.offlineChannels.size == 0 =>
+      log.info(s"reconnect timeout triggered, but peer doesn't have any channels: closing the peer")
+      // NB: there is a possibility of a race with concurrent NewChannel requests because peer do not explicitly acknowledge them
+      // in that case the NewChannel request would simply go to DeadLetters (meaning: ignored)
+      stop(FSM.Normal)
 
     case Event(StateTimeout, _) =>
       log.info(s"attempting a reconnect")
       self ! Reconnect
       stay
-
   }
 
   when(INITIALIZING) {
     case Event(state: HasCommitments, d@InitializingData(_, offlineChannels)) =>
       val channel = spawnChannel(nodeParams, context.system.deadLetters)
       channel ! INPUT_RESTORED(state)
-      stay using d.copy(offlineChannels = offlineChannels :+ HotChannel(state.channelId, channel))
+      stay using d.copy(offlineChannels = offlineChannels + HotChannel(FinalChannelId(state.channelId), channel))
 
     case Event(c: NewChannel, d@InitializingData(_, offlineChannels)) =>
-      stay using d.copy(offlineChannels = offlineChannels :+ BrandNewChannel(c))
+      stay using d.copy(offlineChannels = offlineChannels + BrandNewChannel(c))
 
     case Event(remoteInit: Init, InitializingData(transport, offlineChannels)) =>
       // we store the ip upon successful connection
@@ -105,7 +116,7 @@ class Peer(nodeParams: NodeParams, remoteNodeId: PublicKey, address_opt: Option[
           router ! SendRoutingState(transport)
         }
         // let's bring existing/requested channels online
-        val channels = offlineChannels.map {
+        val channels: Map[ChannelId, ActorRef] = offlineChannels.map {
           case BrandNewChannel(c) =>
             self ! c
             None
@@ -124,13 +135,15 @@ class Peer(nodeParams: NodeParams, remoteNodeId: PublicKey, address_opt: Option[
       log.warning(s"lost connection to $remoteNodeId")
       goto(DISCONNECTED) using DisconnectedData(offlineChannels)
 
-    case Event(Terminated(actor), d@InitializingData(_, offlineChannels)) if offlineChannels.collectFirst { case h: HotChannel if h.a == actor => h }.isDefined =>
-      val h = offlineChannels.collectFirst { case h: HotChannel if h.a == actor => h }.toSeq
-      stay using d.copy(offlineChannels = offlineChannels diff h)
+    case Event(Terminated(actor), d@InitializingData(_, offlineChannels)) if offlineChannels.collect { case h: HotChannel if h.a == actor => h }.size > 0 =>
+      val h = offlineChannels.collect { case h: HotChannel if h.a == actor => h }
+      log.info(s"channel closed: channelId=${h.map(_.channelId).mkString("/")}")
+      stay using d.copy(offlineChannels = offlineChannels -- h)
   }
 
   when(CONNECTED, stateTimeout = nodeParams.pingInterval) {
     case Event(StateTimeout, ConnectedData(transport, _, _)) =>
+      // no need to use secure random here
       val pingSize = Random.nextInt(1000)
       val pongSize = Random.nextInt(1000)
       transport ! Ping(pongSize, BinaryData("00" * pingSize))
@@ -148,10 +161,11 @@ class Peer(nodeParams: NodeParams, remoteNodeId: PublicKey, address_opt: Option[
       log.debug(s"received pong with ${data.length} bytes")
       stay
 
-    case Event(state: HasCommitments, d@ConnectedData(_, _, channels)) =>
+    case Event(state: HasCommitments, d@ConnectedData(transport, _, channels)) =>
       val channel = spawnChannel(nodeParams, context.system.deadLetters)
       channel ! INPUT_RESTORED(state)
-      stay using d.copy(channels = channels + (state.channelId -> channel))
+      channel ! INPUT_RECONNECTED(transport)
+      stay using d.copy(channels = channels + (FinalChannelId(state.channelId) -> channel))
 
     case Event(err@Error(channelId, reason), ConnectedData(transport, _, channels)) if channelId == CHANNELID_ZERO =>
       log.error(s"connection-level error, failing all channels! reason=${new String(reason)}")
@@ -159,37 +173,48 @@ class Peer(nodeParams: NodeParams, remoteNodeId: PublicKey, address_opt: Option[
       transport ! PoisonPill
       stay
 
-    case Event(msg: HasTemporaryChannelId, ConnectedData(_, _, channels)) if channels.contains(msg.temporaryChannelId) =>
-      val channel = channels(msg.temporaryChannelId)
+    case Event(msg: Error, ConnectedData(_, _, channels)) =>
+      // error messages are a bit special because they can contain either temporaryChannelId or channelId (see BOLT 1)
+      channels.get(TemporaryChannelId(msg.channelId)).orElse(channels.get(FinalChannelId(msg.channelId))) match {
+        case Some(channel) => channel forward msg
+        case None => log.warning(s"couldn't resolve channel for $msg")
+      }
+      stay
+
+    case Event(msg: HasTemporaryChannelId, ConnectedData(_, _, channels)) if channels.contains(TemporaryChannelId(msg.temporaryChannelId)) =>
+      val channel = channels(TemporaryChannelId(msg.temporaryChannelId))
       channel forward msg
       stay
 
-    case Event(msg: HasChannelId, ConnectedData(_, _, channels)) if channels.contains(msg.channelId) =>
-      val channel = channels(msg.channelId)
+    case Event(msg: HasChannelId, ConnectedData(_, _, channels)) if channels.contains(FinalChannelId(msg.channelId)) =>
+      val channel = channels(FinalChannelId(msg.channelId))
       channel forward msg
       stay
 
-    case Event(ChannelIdAssigned(channel, temporaryChannelId, channelId), d@ConnectedData(_, _, channels)) if channels.contains(temporaryChannelId) =>
+    case Event(ChannelIdAssigned(channel, temporaryChannelId, channelId), d@ConnectedData(_, _, channels)) if channels.contains(TemporaryChannelId(temporaryChannelId)) =>
       log.info(s"channel id switch: previousId=$temporaryChannelId nextId=$channelId")
-      stay using d.copy(channels = channels - temporaryChannelId + (channelId -> channel))
+      // NB: we keep the temporary channel id because the switch is not always acknowledged at this point (see https://github.com/lightningnetwork/lightning-rfc/pull/151)
+      // we won't clean it up, but we won't remember the temporary id on channel termination
+      stay using d.copy(channels = channels + (FinalChannelId(channelId) -> channel))
 
     case Event(c: NewChannel, d@ConnectedData(transport, remoteInit, channels)) =>
       log.info(s"requesting a new channel to $remoteNodeId with fundingSatoshis=${c.fundingSatoshis} and pushMsat=${c.pushMsat}")
       val (channel, localParams) = createChannel(nodeParams, transport, funder = true, c.fundingSatoshis.toLong)
-      val temporaryChannelId = randomTemporaryChannelId
+      val temporaryChannelId = randomBytes(32)
       channel ! INPUT_INIT_FUNDER(temporaryChannelId, c.fundingSatoshis.amount, c.pushMsat.amount, Globals.feeratePerKw.get, localParams, transport, remoteInit)
-      stay using d.copy(channels = channels + (temporaryChannelId -> channel))
+      stay using d.copy(channels = channels + (TemporaryChannelId(temporaryChannelId) -> channel))
 
-    case Event(msg: OpenChannel, d@ConnectedData(transport, remoteInit, channels)) if !channels.contains(msg.temporaryChannelId) =>
+    case Event(msg: OpenChannel, d@ConnectedData(transport, remoteInit, channels)) if !channels.contains(TemporaryChannelId(msg.temporaryChannelId)) =>
       log.info(s"accepting a new channel to $remoteNodeId")
       val (channel, localParams) = createChannel(nodeParams, transport, funder = false, fundingSatoshis = msg.fundingSatoshis)
       val temporaryChannelId = msg.temporaryChannelId
       channel ! INPUT_INIT_FUNDEE(temporaryChannelId, localParams, transport, remoteInit)
       channel ! msg
-      stay using d.copy(channels = channels + (temporaryChannelId -> channel))
+      stay using d.copy(channels = channels + (TemporaryChannelId(temporaryChannelId) -> channel))
 
-    case Event(Rebroadcast(announcements), ConnectedData(transport, _, _)) =>
-      announcements.foreach(transport forward _)
+    case Event(Rebroadcast(announcements, origins), ConnectedData(transport, _, _)) =>
+      // we filter out announcements that we received from this node
+      announcements.filterNot(ann => origins.getOrElse(ann, context.system.deadLetters) == self).foreach(transport forward _)
       stay
 
     case Event(msg: RoutingMessage, _) =>
@@ -203,18 +228,18 @@ class Peer(nodeParams: NodeParams, remoteNodeId: PublicKey, address_opt: Option[
     case Event(Terminated(actor), ConnectedData(transport, _, channels)) if actor == transport =>
       log.warning(s"lost connection to $remoteNodeId")
       channels.values.foreach(_ ! INPUT_DISCONNECTED)
-      goto(DISCONNECTED) using DisconnectedData(channels.toSeq.map(c => HotChannel(c._1, c._2)))
+      val c: Set[OfflineChannel] = channels.map(c => HotChannel(c._1, c._2)).toSet
+      goto(DISCONNECTED) using DisconnectedData(c)
 
     case Event(Terminated(actor), d@ConnectedData(transport, _, channels)) if channels.values.toSet.contains(actor) =>
-      val channelId = channels.find(_._2 == actor).get._1
-      log.info(s"channel closed: channelId=$channelId")
-      if (channels.size == 1) {
+      // we will have at most 2 ids: a TemporaryChannelId and a FinalChannelId
+      val channelIds = channels.filter(_._2 == actor).map(_._1)
+      log.info(s"channel closed: channelId=${channelIds.mkString("/")}")
+      if (channels.values.toSet - actor == Set.empty) {
         log.info(s"that was the last open channel, closing the connection")
         transport ! PoisonPill
-        // NB: we could terminate the peer, but it would create a race issue with concurrent NewChannel requests that would go to DeadLetters without switchboard being aware
-        // for now we just leave it as-is
       }
-      stay using d.copy(channels = channels - channelId)
+      stay using d.copy(channels = channels -- channelIds)
 
   }
 
@@ -247,7 +272,8 @@ object Peer {
 
   def makeChannelParams(nodeParams: NodeParams, defaultFinalScriptPubKey: BinaryData, isFunder: Boolean, fundingSatoshis: Long): LocalParams = {
     // all secrets are generated from the main seed
-    val keyIndex = Random.nextInt(1000).toLong
+    // TODO: check this
+    val keyIndex = secureRandom.nextInt(1000).toLong
     LocalParams(
       nodeId = nodeParams.privateKey.publicKey,
       dustLimitSatoshis = nodeParams.dustLimitSatoshis,
@@ -267,9 +293,4 @@ object Peer {
       localFeatures = nodeParams.localFeatures)
   }
 
-  def randomTemporaryChannelId: BinaryData = {
-    val bin = Array.fill[Byte](32)(0)
-    Random.nextBytes(bin)
-    bin
-  }
 }

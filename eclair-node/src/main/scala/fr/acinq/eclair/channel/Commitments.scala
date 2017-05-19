@@ -81,6 +81,10 @@ object Commitments extends Logging {
       return Left(IncorrectPaymentAmount -> DebugTriggeredException)
     }
 
+    if (cmd.paymentHash.size != 32) {
+      return Left(TemporaryChannelFailure -> InvalidPaymentHash)
+    }
+
     val blockCount = Globals.blockCount.get()
     if (cmd.expiry <= blockCount) {
       return Left(FinalExpiryTooSoon -> ExpiryCannotBeInThePast(cmd.expiry, blockCount))
@@ -129,6 +133,10 @@ object Commitments extends Logging {
 
         if (add.id != commitments.remoteNextHtlcId) {
           throw UnexpectedHtlcId(expected = commitments.remoteNextHtlcId, actual = add.id)
+        }
+
+        if (add.paymentHash.size != 32) {
+          throw InvalidPaymentHash
         }
 
         val blockCount = Globals.blockCount.get()
@@ -396,11 +404,7 @@ object Commitments extends Logging {
         val htlcSigs = sortedHtlcTxs.map(Transactions.sign(_, localPaymentKey))
         val remotePaymentPubkey = Generators.derivePubKey(remoteParams.paymentBasepoint, localPerCommitmentPoint)
         // combine the sigs to make signed txes
-        val htlcTxsAndSigs = sortedHtlcTxs
-          .zip(htlcSigs)
-          .zip(commit.htlcSignatures) // this is a list of ((tx, localSig), remoteSig)
-          .map(e => (e._1._1, e._1._2, e._2)) // this is a list of (tx, localSig, remoteSig)
-          .collect {
+        val htlcTxsAndSigs = (sortedHtlcTxs, htlcSigs, commit.htlcSignatures).zipped.toList.collect {
           case (htlcTx: HtlcTimeoutTx, localSig, remoteSig) =>
             require(Transactions.checkSpendable(Transactions.addSigs(htlcTx, localSig, remoteSig)).isSuccess, "bad sig")
             HtlcTxAndSigs(htlcTx, localSig, remoteSig)
