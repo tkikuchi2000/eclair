@@ -4,8 +4,8 @@
     <modelVersion>4.0.0</modelVersion>
     <parent>
         <groupId>fr.acinq.eclair</groupId>
-        <artifactId>eclair_2.11</artifactId>
-        <version>0.2-SNAPSHOT-mona1</version>
+        <artifactId>eclair_mona_2.11</artifactId>
+        <version>0.2-SNAPSHOT</version>
     </parent>
 
     <artifactId>eclair-node_2.11</artifactId>
@@ -173,11 +173,11 @@
             <artifactId>akka-http-json4s_${scala.version.short}</artifactId>
             <version>1.11.0</version>
         </dependency>
-        <!-- BITCOIN -->
+        <!-- MONACOIN -->
         <dependency>
-            <groupId>fr.acinq</groupId>
-            <artifactId>bitcoin-lib_${scala.version.short}</artifactId>
-            <version>${bitcoinlib.version}</version>
+            <groupId>org.monaco-ex</groupId>
+            <artifactId>monacoin-lib_${scala.version.short}</artifactId>
+            <version>${monacoinlib.version}</version>
             <exclusions>
                 <exclusion>
                     <groupId>com.google.protobuf</groupId>
